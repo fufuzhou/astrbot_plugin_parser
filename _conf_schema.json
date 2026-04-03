@@ -358,6 +358,12 @@
                         "hint": "选填",
                         "type": "text",
                         "default": ""
+                    },
+                    "block_sensitive": {
+                        "description": "拦截成人内容",
+                        "hint": "开启后，检测到推特成人/敏感媒体会跳过转发",
+                        "type": "bool",
+                        "default": false
                     }
                 }
             },

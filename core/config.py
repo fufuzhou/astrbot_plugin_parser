@@ -153,6 +153,7 @@ class ParserItem(ConfigNode):
     enable: bool
     use_proxy: bool
     cookies: str | None
+    block_sensitive: bool | None
     video_codecs: str | None
     video_quality: str | None
 
@@ -269,4 +270,3 @@ class PluginConfig(ConfigNode):
         if umo in self.blacklist:
             self.blacklist.remove(umo)
             self.save_config()
-

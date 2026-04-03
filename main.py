@@ -1,4 +1,4 @@
-# main.py
+﻿# main.py
 
 import asyncio
 import re
@@ -7,7 +7,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
-from astrbot.core.message.components import At, Image, Json
+from astrbot.core.message.components import At, Image, Json, Plain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
@@ -18,6 +18,7 @@ from .core.clean import CacheCleaner
 from .core.config import PluginConfig
 from .core.debounce import Debouncer
 from .core.download import Downloader
+from .core.exception import ParseException, TipException
 from .core.parsers import BaseParser, BilibiliParser
 from .core.render import Renderer
 from .core.sender import MessageSender
@@ -28,53 +29,85 @@ class ParserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.cfg = PluginConfig(config, context=context)
-        # 渲染器
+
         self.renderer = Renderer(self.cfg)
-        # 下载器
         self.downloader = Downloader(self.cfg)
-        # 防抖器
         self.debouncer = Debouncer(self.cfg)
-        # 仲裁器
         self.arbiter = EmojiLikeArbiter()
-        # 消息发送器
         self.sender = MessageSender(self.cfg, self.renderer)
-        # 缓存清理器
         self.cleaner = CacheCleaner(self.cfg)
-        # 关键词 -> Parser 映射
+
         self.parser_map: dict[str, BaseParser] = {}
-        # 关键词 -> 正则 列表
         self.key_pattern_list: list[tuple[str, re.Pattern[str]]] = []
 
+    def _get_debounce_session_key(self, event: AstrMessageEvent) -> str:
+        """Get a stable debounce key per chat session."""
+        if isinstance(event, AiocqhttpMessageEvent):
+            raw = event.message_obj.raw_message
+            if isinstance(raw, dict):
+                group_id = raw.get("group_id")
+                if group_id is not None:
+                    return f"group:{group_id}"
+                channel_id = raw.get("channel_id")
+                if channel_id is not None:
+                    return f"group:{channel_id}"
+                guild_id = raw.get("guild_id")
+                if guild_id is not None:
+                    return f"group:{guild_id}"
+                user_id = raw.get("user_id")
+                if user_id is not None:
+                    return f"private:{user_id}"
+
+        # Fallback for other adapters: try to infer chat scope from origin text.
+        origin = str(event.unified_msg_origin)
+        lower = origin.lower()
+
+        if m := re.search(r"(?:group|guild|channel|room)[^0-9]*(\d+)", lower):
+            return f"group:{m.group(1)}"
+        if m := re.search(r"(?:private|friend|dm|user)[^0-9]*(\d+)", lower):
+            return f"private:{m.group(1)}"
+
+        # Heuristic fallback: many origins end with sender id in group chats.
+        nums = re.findall(r"\d+", origin)
+        is_private_chat = None
+        checker = getattr(event, "is_private_chat", None)
+        if callable(checker):
+            try:
+                is_private_chat = bool(checker())
+            except Exception:
+                is_private_chat = None
+        if is_private_chat is False and len(nums) >= 2:
+            return f"group:{nums[-2]}"
+        if is_private_chat is True and nums:
+            return f"private:{nums[-1]}"
+
+        return origin
 
     async def initialize(self):
-        """加载、重载插件时触发"""
-        # 加载渲染器资源
+        """Called when plugin loads/reloads."""
         await asyncio.to_thread(Renderer.load_resources)
-        # 注册解析器
         self._register_parser()
 
     async def terminate(self):
-        """插件卸载时触发"""
-        # 关下载器里的会话
+        """Called when plugin unloads."""
         await self.downloader.close()
-        # 关所有解析器里的会话 (去重后的实例)
+
         unique_parsers = set(self.parser_map.values())
         for parser in unique_parsers:
             await parser.close_session()
-        # 关缓存清理器
+
         await self.cleaner.stop()
 
     def _register_parser(self):
-        """注册解析器（以 parser.enable 为唯一启用来源）"""
-        # 所有 Parser 子类
+        """Register parsers enabled by parser.enable."""
         all_subclass = BaseParser.get_all_subclass()
         enabled_platforms = set(self.cfg.parser.enabled_platforms())
 
         enabled_classes: list[type[BaseParser]] = []
         enabled_names: list[str] = []
+
         for cls in all_subclass:
             platform_name = cls.platform.name
-
             if platform_name not in enabled_platforms:
                 logger.debug(f"[parser] 平台未启用或未配置: {platform_name}")
                 continue
@@ -82,28 +115,21 @@ class ParserPlugin(Star):
             enabled_classes.append(cls)
             enabled_names.append(platform_name)
 
-            # 一个平台一个 parser 实例
             parser = cls(self.cfg, self.downloader)
-
-            # 关键词 → parser
             for keyword, _ in cls._key_patterns:
                 self.parser_map[keyword] = parser
 
         logger.debug(f"启用平台: {'、'.join(enabled_names) if enabled_names else '无'}")
 
-        # -------- 关键词-正则表（统一生成） --------
         patterns: list[tuple[str, re.Pattern[str]]] = []
-
         for cls in enabled_classes:
             for kw, pat in cls._key_patterns:
                 patterns.append((kw, re.compile(pat) if isinstance(pat, str) else pat))
 
-        # 长关键词优先，避免短词抢匹配
         patterns.sort(key=lambda x: -len(x[0]))
-
         self.key_pattern_list = patterns
 
-        logger.debug(f"[parser] 关键词-正则对已生成: {[kw for kw, _ in patterns]}")
+        logger.debug(f"[parser] 关键字正则对已生成: {[kw for kw, _ in patterns]}")
 
     def _get_parser_by_type(self, parser_type):
         for parser in self.parser_map.values():
@@ -113,18 +139,23 @@ class ParserPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        """消息的统一入口"""
+        """Unified message entry."""
         umo = event.unified_msg_origin
+        debounce_session = self._get_debounce_session_key(event)
 
-        # 白名单
+        # Ignore self-sent messages to avoid recursive re-parsing.
+        if isinstance(event, AiocqhttpMessageEvent):
+            raw = event.message_obj.raw_message
+            if isinstance(raw, dict):
+                sender_id = raw.get("user_id")
+                if sender_id is not None and str(sender_id) == str(event.get_self_id()):
+                    return
+
         if self.cfg.whitelist and umo not in self.cfg.whitelist:
             return
-
-        # 黑名单
         if self.cfg.blacklist and umo in self.cfg.blacklist:
             return
 
-        # 消息链
         chain = event.get_messages()
         if not chain:
             return
@@ -132,21 +163,17 @@ class ParserPlugin(Star):
         seg1 = chain[0]
         text = event.message_str
 
-        # 卡片解析：解析Json组件，提取URL
         if isinstance(seg1, Json):
             text = extract_json_url(seg1.data)
-            logger.debug(f"解析Json组件: {text}")
+            logger.debug(f"解析 Json 组件: {text}")
 
         if not text:
             return
 
         self_id = event.get_self_id()
-
-        # 指定机制：专门@其他bot的消息不解析
         if isinstance(seg1, At) and str(seg1.qq) != self_id:
             return
 
-        # 核心匹配逻辑 ：关键词 + 正则双重判定，汇集了所有解析器的正则对。
         keyword: str = ""
         searched: re.Match[str] | None = None
         for kw, pat in self.key_pattern_list:
@@ -155,16 +182,17 @@ class ParserPlugin(Star):
             if m := pat.search(text):
                 keyword, searched = kw, m
                 break
+
         if searched is None:
             return
         logger.debug(f"匹配结果: {keyword}, {searched}")
 
-        # 仲裁机制
         if isinstance(event, AiocqhttpMessageEvent) and not event.is_private_chat():
             raw = event.message_obj.raw_message
             if not isinstance(raw, dict):
                 logger.warning(f"Unexpected raw_message type: {type(raw)}")
                 return
+
             is_win = await self.arbiter.compete(
                 bot=event.bot,
                 ctx=ArbiterContext(
@@ -174,32 +202,36 @@ class ParserPlugin(Star):
                 ),
             )
             if not is_win:
-                logger.debug("Bot在仲裁中输了, 跳过解析")
+                logger.debug("Bot 在仲裁中未获胜，跳过解析")
                 return
-            logger.debug("Bot在仲裁中胜出, 准备解析...")
+            logger.debug("Bot 在仲裁中获胜，开始解析")
 
-        # 基于link防抖
         link = searched.group(0)
-        if self.debouncer.hit_link(umo, link):
+        if self.debouncer.hit_link(debounce_session, link):
             logger.warning(f"[链接防抖] 链接 {link} 在防抖时间内，跳过解析")
             return
 
-        # 解析
-        parse_res = await self.parser_map[keyword].parse(keyword, searched)
+        try:
+            parse_res = await self.parser_map[keyword].parse(keyword, searched)
+        except TipException as exc:
+            msg = exc.message or "可能含有成人/敏感内容，已按配置不予解析"
+            await event.send(event.chain_result([Plain(msg)]))
+            return
+        except ParseException as exc:
+            logger.warning(f"解析失败: {exc.message}")
+            return
 
-        # 基于资源ID防抖
         resource_id = parse_res.get_resource_id()
-        if self.debouncer.hit_resource(umo, resource_id):
+        if self.debouncer.hit_resource(debounce_session, resource_id):
             logger.warning(f"[资源防抖] 资源 {resource_id} 在防抖时间内，跳过发送")
             return
 
-        # 发送
         await self.sender.send_parse_result(event, parse_res)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("开启解析")
     async def open_parser(self, event: AstrMessageEvent):
-        """开启当前会话的解析"""
+        """Enable parsing for current session."""
         umo = event.unified_msg_origin
         self.cfg.remove_blacklist(umo)
         yield event.plain_result("当前会话的解析已开启")
@@ -207,7 +239,7 @@ class ParserPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("关闭解析")
     async def close_parser(self, event: AstrMessageEvent):
-        """关闭当前会话的解析"""
+        """Disable parsing for current session."""
         umo = event.unified_msg_origin
         self.cfg.add_blacklist(umo)
         yield event.plain_result("当前会话的解析已关闭")
@@ -215,7 +247,7 @@ class ParserPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("登录B站", alias={"blogin", "登录b站"})
     async def login_bilibili(self, event: AstrMessageEvent):
-        """扫码登录B站"""
+        """Login bilibili with QR code."""
         parser: BilibiliParser = self._get_parser_by_type(BilibiliParser)  # type: ignore
         qrcode = await parser.login.login_with_qrcode()
         yield event.chain_result([Image.fromBytes(qrcode)])
