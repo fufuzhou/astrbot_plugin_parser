@@ -130,6 +130,8 @@ class WeiBoParser(BaseParser):
             elif element.name == "img":
                 src = element.get("src")
                 if isinstance(src, str):
+                    if "face.t.sinajs.cn" in src:
+                        continue
                     text = "\n\n".join(text_buffer)
                     contents.append(self.create_graphics_content(src, text=text))
                     text_buffer.clear()
@@ -335,6 +337,8 @@ class WeiBoParser(BaseParser):
         deduped: list[str] = []
         for url in urls:
             if not url:
+                continue
+            if "face.t.sinajs.cn" in url:
                 continue
             key = cls._image_dedupe_key(url)
             if key in seen_keys:
@@ -615,6 +619,8 @@ class WeiboData(Struct):
         deduped: list[str] = []
         for url in urls:
             if not url or url in seen:
+                continue
+            if "face.t.sinajs.cn" in url:
                 continue
             seen.add(url)
             deduped.append(url)
