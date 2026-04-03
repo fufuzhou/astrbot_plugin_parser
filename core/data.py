@@ -80,6 +80,23 @@ class ImageContent(MediaContent):
     pass
 
 
+@dataclass(repr=False, slots=True, init=False)
+class TextContent(MediaContent):
+    """文本内容，用于把纯文本作为标准消息项参与发送/合并"""
+
+    text: str
+
+    def __init__(self, text: str):
+        MediaContent.__init__(self, Path("."))
+        self.text = text
+
+    async def get_path(self) -> Path:
+        raise RuntimeError("TextContent does not have a filesystem path")
+
+    def __repr__(self) -> str:
+        return f"TextContent(text={self.text})"
+
+
 @dataclass(repr=False, slots=True)
 class DynamicContent(MediaContent):
     """动态内容 视频格式 后续转 gif"""
@@ -144,6 +161,15 @@ class Author:
 
 
 @dataclass(repr=False, slots=True)
+class SendGroup:
+    """通用发送分组。sender 按分组顺序执行，但不理解平台语义。"""
+
+    contents: list[MediaContent] = field(default_factory=list)
+    force_merge: bool | None = None
+    render_card: bool | None = None
+
+
+@dataclass(repr=False, slots=True)
 class ParseResult:
     """完整的解析结果"""
 
@@ -161,6 +187,8 @@ class ParseResult:
     """来源链接"""
     contents: list[MediaContent] = field(default_factory=list)
     """媒体内容"""
+    send_groups: list[SendGroup] = field(default_factory=list)
+    """可选的发送分组；为空时沿用默认发送流程"""
     extra: dict[str, Any] = field(default_factory=dict)
     """额外信息"""
     repost: "ParseResult | None" = None
@@ -169,6 +197,7 @@ class ParseResult:
     """渲染图片"""
     _resource_id: str | None = field(init=False, repr=False)
     """资源 ID"""
+
     @property
     def header(self) -> str | None:
         """头信息 仅用于 default render"""
@@ -216,13 +245,16 @@ class ParseResult:
         return [cont for cont in self.contents if isinstance(cont, GraphicsContent)]
 
     @property
+    def text_contents(self) -> list[TextContent]:
+        return [cont for cont in self.contents if isinstance(cont, TextContent)]
+
+    @property
     async def cover_path(self) -> Path | None:
         """获取封面路径"""
         for cont in self.contents:
             if isinstance(cont, VideoContent):
                 return await cont.get_cover_path()
         return None
-
 
     def formatted_datetime(self, fmt: str = "%Y-%m-%d %H:%M:%S") -> str | None:
         """格式化时间戳"""
@@ -285,6 +317,27 @@ class ParseResult:
             elif isinstance(cont, GraphicsContent):
                 add(cont.text)
                 add(cont.alt)
+            elif isinstance(cont, TextContent):
+                add(cont.text)
+
+        add(len(self.send_groups))
+        for group in self.send_groups:
+            add(group.force_merge)
+            add(group.render_card)
+            add(len(group.contents))
+            for cont in group.contents:
+                add(cont.__class__.__name__)
+                if isinstance(cont, VideoContent):
+                    add(cont.duration)
+                elif isinstance(cont, AudioContent):
+                    add(cont.duration)
+                elif isinstance(cont, FileContent):
+                    add(cont.name)
+                elif isinstance(cont, GraphicsContent):
+                    add(cont.text)
+                    add(cont.alt)
+                elif isinstance(cont, TextContent):
+                    add(cont.text)
 
         # ---------- 转发 ----------
         if self.repost:
@@ -294,11 +347,11 @@ class ParseResult:
         return self._resource_id
 
 
-
 class ParseResultKwargs(TypedDict, total=False):
     title: str | None
     text: str | None
     contents: list[MediaContent]
+    send_groups: list[SendGroup]
     timestamp: int | None
     url: str | None
     author: Author | None

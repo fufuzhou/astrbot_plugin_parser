@@ -154,6 +154,8 @@ class ParserItem(ConfigNode):
     use_proxy: bool
     cookies: str | None
     block_sensitive: bool | None
+    show_body_text: bool | None
+    video_send_mode: str | None
     video_codecs: str | None
     video_quality: str | None
 
@@ -173,6 +175,8 @@ class ParserConfig(ConfigNodeContainer):
     tiktok: ParserItem
     twitter: ParserItem
     weibo: ParserItem
+    xiaoheihe: ParserItem
+    zhihu: ParserItem
     xhs: ParserItem
     youtube: ParserItem
 

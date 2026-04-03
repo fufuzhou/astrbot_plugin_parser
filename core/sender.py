@@ -5,6 +5,7 @@ from asyncio import Task
 from itertools import chain
 from pathlib import Path
 
+from astrbot.api import logger
 from astrbot.core.message.components import (
     BaseMessageComponent,
     File,
@@ -12,6 +13,8 @@ from astrbot.core.message.components import (
     Node,
     Nodes,
     Plain,
+    Record,
+    Video,
 )
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
@@ -23,6 +26,8 @@ from .data import (
     GraphicsContent,
     ImageContent,
     ParseResult,
+    SendGroup,
+    TextContent,
     VideoContent,
 )
 from .exception import (
@@ -39,14 +44,41 @@ class MessageSender:
         self.cfg = config
         self.renderer = renderer
 
-    def _build_send_plan(self, result: ParseResult) -> dict:
+    def _to_file_uri(self, path: Path) -> str:
+        if not path.is_absolute():
+            path = path.resolve()
+        posix_path = path.as_posix()
+        if posix_path.startswith("/"):
+            return f"file:////{posix_path.lstrip('/')}"
+        return path.as_uri()
+
+    @staticmethod
+    def _iter_contents(result: ParseResult):
+        return chain(result.contents, result.repost.contents if result.repost else ())
+
+    def _build_send_plan(
+        self,
+        result: ParseResult,
+        contents: list | tuple | None = None,
+        *,
+        force_merge_override: bool | None = None,
+        render_card_override: bool | None = None,
+    ) -> dict:
+        """
+        根据解析结果生成发送计划（plan）
+
+        plan 只做“策略决策”，不做任何 IO 或发送动作。
+        后续发送流程严格按 plan 执行，避免逻辑分散。
+        """
         light: list = []
         heavy: list = []
         links: list[VideoContent | AudioContent | DynamicContent] = []
 
-        for cont in chain(result.contents, result.repost.contents if result.repost else ()):  # type: ignore[arg-type]
+        # 合并主内容 + 转发内容，统一参与发送策略计算
+        iterable = contents if contents is not None else self._iter_contents(result)
+        for cont in iterable:
             match cont:
-                case ImageContent() | GraphicsContent():
+                case ImageContent() | GraphicsContent() | TextContent():
                     light.append(cont)
                 case VideoContent() | AudioContent() | DynamicContent():
                     self._cancel_pending_media_download(cont)
@@ -60,12 +92,17 @@ class MessageSender:
 
         is_single_heavy = len(heavy) == 1 and not light and not links
         render_card = is_single_heavy and self.cfg.single_heavy_render_card
+        
+        if render_card_override is not None:
+            render_card = render_card_override
 
         seg_count = len(light) + len(heavy) + len(links) + (1 if render_card else 0)
         if summary_text:
             seg_count += 1
 
         force_merge = seg_count >= self.cfg.forward_threshold
+        if force_merge_override is not None:
+            force_merge = force_merge_override
 
         return {
             "light": light,
@@ -140,7 +177,7 @@ class MessageSender:
             return
 
         if image_path := await self.renderer.render_card(result):
-            await event.send(event.chain_result([Image(str(image_path))]))
+            await event.send(event.chain_result([Image(self._to_file_uri(image_path))]))
 
     async def _build_segments(
         self,
@@ -154,7 +191,7 @@ class MessageSender:
 
         if plan["render_card"] and plan["force_merge"]:
             if image_path := await self.renderer.render_card(result):
-                segs.append(Image(str(image_path)))
+                segs.append(Image(self._to_file_uri(image_path)))
 
         seen_links: set[str] = set()
         for cont in plan["links"]:
@@ -163,7 +200,7 @@ class MessageSender:
                     try:
                         cover_path = await cont.get_cover_path()
                         if cover_path:
-                            segs.append(Image(str(cover_path)))
+                            segs.append(Image(self._to_file_uri(cover_path)))
                     except (DownloadException, DownloadLimitException, ZeroSizeException):
                         pass
 
@@ -185,6 +222,11 @@ class MessageSender:
                         seen_links.add(url)
 
         for cont in plan["light"]:
+            if isinstance(cont, TextContent):
+                if cont.text:
+                    segs.append(Plain(cont.text))
+                continue
+
             try:
                 path: Path = await cont.get_path()
             except (DownloadLimitException, ZeroSizeException):
@@ -196,9 +238,11 @@ class MessageSender:
 
             match cont:
                 case ImageContent():
-                    segs.append(Image(str(path)))
+                    segs.append(Image(self._to_file_uri(path)))
                 case GraphicsContent() as g:
-                    segs.append(Image(str(path)))
+                    # OneBot/aiocqhttp 本地文件参数要求 file:// URI，而非裸本地路径。
+                    segs.append(Image(self._to_file_uri(path)))
+                    # GraphicsContent 允许携带补充文本
                     if g.text:
                         segs.append(Plain(g.text))
                     if g.alt:
@@ -218,7 +262,7 @@ class MessageSender:
                     segs.append(Plain("此项媒体下载失败"))
                 continue
 
-            segs.append(File(name=path.name, file=str(path)))
+            segs.append(File(name=path.name, file=self._to_file_uri(path)))
 
         return segs
 
@@ -238,17 +282,99 @@ class MessageSender:
 
         return [nodes]
 
-    async def send_parse_result(
+    @staticmethod
+    def _build_text_fallback(result: ParseResult) -> list[BaseMessageComponent]:
+        lines: list[str] = []
+        if result.header:
+            lines.append(result.header)
+        if result.text:
+            lines.append(result.text)
+        elif result.extra.get("info"):
+            lines.append(str(result.extra["info"]))
+
+        text = "\n".join(line for line in lines if line).strip()
+        return [Plain(text)] if text else []
+
+    def _resolve_groups(self, result: ParseResult) -> list[SendGroup]:
+        if result.send_groups:
+            return result.send_groups
+        return [SendGroup(contents=list(MessageSender._iter_contents(result)))]
+
+    async def _send_group(
         self,
         event: AstrMessageEvent,
         result: ParseResult,
-    ):
-        plan = self._build_send_plan(result)
+        group: SendGroup,
+    ) -> bool:
+        plan = self._build_send_plan(
+            result,
+            group.contents,
+            force_merge_override=group.force_merge,
+            render_card_override=group.render_card,
+        )
 
         await self._send_preview_card(event, result, plan)
 
         segs = await self._build_segments(result, plan)
         segs = self._merge_segments_if_needed(event, segs, plan["force_merge"])
 
-        if segs:
+        if not segs:
+            return False
+
+        try:
             await event.send(event.chain_result(segs))
+            return True
+        except Exception as e:
+            seg_meta = self._collect_seg_meta(segs)
+            logger.error(f"发送解析结果失败： error={e}, segments={seg_meta}")
+            return False
+
+    @staticmethod
+    def _collect_seg_meta(segs: list[BaseMessageComponent]) -> list[dict[str, str]]:
+        """提取消息段元信息，用于失败日志定位。"""
+        meta: list[dict[str, str]] = []
+
+        for seg in segs:
+            item = {"type": seg.__class__.__name__}
+            for attr in ("file", "path", "url"):
+                value = getattr(seg, attr, None)
+                if value:
+                    item["media"] = str(value)
+                    break
+            meta.append(item)
+
+        return meta
+
+    async def send_parse_result(
+        self,
+        event: AstrMessageEvent,
+        result: ParseResult,
+    ):
+        """
+        发送解析结果的统一入口
+
+        执行顺序固定：
+        1. 构建发送计划
+        2. 发送预览卡片（如有）
+        3. 构建消息段
+        4. 必要时合并转发
+        5. 最终发送
+        """
+        groups = self._resolve_groups(result)
+
+        sent = False
+        for group in groups:
+            sent = await self._send_group(event, result, group) or sent
+
+        if not sent:
+            segs = self._build_text_fallback(result)
+            if not segs:
+                logger.warning("发送结果为空，不执行发送")
+                return
+
+            try:
+                await event.send(event.chain_result(segs))
+            except Exception as e:
+                seg_meta = self._collect_seg_meta(segs)
+                logger.error(f"发送解析结果失败： error={e}, segments={seg_meta}")
+            return
