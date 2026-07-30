@@ -207,7 +207,7 @@ class TwitterParser(BaseParser):
         (
             r"(?<![A-Za-z0-9.-])(?:https?://)?(?:(?:www|mobile)\.)?x\.com/"
             r"(?P<username>[0-9A-Za-z_]+)(?:/[0-9A-Za-z_]+)*/status/"
-            r"(?P<status_id>\d+)(?:\?[^\s]*)?"
+            r"(?P<status_id>\d+)(?:\?[A-Za-z0-9_%=&./:+~-]*[A-Za-z0-9_%])?"
         ),
     )
     @handle(
@@ -215,7 +215,7 @@ class TwitterParser(BaseParser):
         (
             r"(?<![A-Za-z0-9.-])(?:https?://)?(?:(?:www|mobile)\.)?twitter\.com/"
             r"(?P<username>[0-9A-Za-z_]+)(?:/[0-9A-Za-z_]+)*/status/"
-            r"(?P<status_id>\d+)(?:\?[^\s]*)?"
+            r"(?P<status_id>\d+)(?:\?[A-Za-z0-9_%=&./:+~-]*[A-Za-z0-9_%])?"
         ),
     )
     async def _parse(self, searched: re.Match[str]) -> ParseResult:
@@ -225,17 +225,22 @@ class TwitterParser(BaseParser):
         username = searched.groupdict().get("username")
         status_id = searched.groupdict().get("status_id")
 
-        resp = await self._req_xdown_api(url)
-        if resp.get("status") != "ok":
-            raise ParseException("解析失败")
-
-        html_content = resp.get("data")
-        if html_content is None:
-            raise ParseException("解析失败, 数据为空")
-
         syndication_payload = (
             await self._req_syndication_api(status_id) if status_id else None
         )
+
+        try:
+            resp = await self._req_xdown_api(url)
+        except ClientError:
+            if not syndication_payload:
+                raise
+            resp = {}
+
+        html_content = resp.get("data") if resp.get("status") == "ok" else None
+        if not html_content:
+            if not syndication_payload:
+                raise ParseException("解析失败, 数据为空")
+            html_content = ""
 
         if self.block_sensitive and await self._is_sensitive_tweet(
             status_id,

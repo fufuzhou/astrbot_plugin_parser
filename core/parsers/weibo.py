@@ -17,6 +17,19 @@ from ..download import Downloader
 from .base import BaseParser, ParseException, Platform, handle
 
 
+def _is_non_content_image_url(url: str) -> bool:
+    normalized = url.replace("&amp;", "&")
+    if normalized.startswith("//"):
+        normalized = f"https:{normalized}"
+
+    parsed = urlparse(normalized)
+    host = parsed.netloc.lower().split(":")[0]
+    path = parsed.path.lower()
+    if host == "face.t.sinajs.cn":
+        return True
+    return host == "h5.sinaimg.cn" and "timeline_card_" in path
+
+
 class WeiBoParser(BaseParser):
     # 平台信息
     platform: ClassVar[Platform] = Platform(name="weibo", display_name="微博")
@@ -130,7 +143,7 @@ class WeiBoParser(BaseParser):
             elif element.name == "img":
                 src = element.get("src")
                 if isinstance(src, str):
-                    if "face.t.sinajs.cn" in src:
+                    if _is_non_content_image_url(src):
                         continue
                     text = "\n\n".join(text_buffer)
                     contents.append(self.create_graphics_content(src, text=text))
@@ -338,7 +351,7 @@ class WeiBoParser(BaseParser):
         for url in urls:
             if not url:
                 continue
-            if "face.t.sinajs.cn" in url:
+            if _is_non_content_image_url(url):
                 continue
             key = cls._image_dedupe_key(url)
             if key in seen_keys:
@@ -620,7 +633,7 @@ class WeiboData(Struct):
         for url in urls:
             if not url or url in seen:
                 continue
-            if "face.t.sinajs.cn" in url:
+            if _is_non_content_image_url(url):
                 continue
             seen.add(url)
             deduped.append(url)
