@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import zoneinfo
 from collections.abc import Mapping, MutableMapping
+from pathlib import Path
 from types import MappingProxyType, UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
@@ -11,7 +11,10 @@ from astrbot.api import logger
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.star.context import Context
 from astrbot.core.star.star_tools import StarTools
-from astrbot.core.utils.astrbot_path import get_astrbot_plugin_path
+from astrbot.core.utils.astrbot_path import (
+    get_astrbot_data_path,
+    get_astrbot_plugin_path,
+)
 
 
 class ConfigNode:
@@ -156,8 +159,10 @@ class ParserItem(ConfigNode):
     block_sensitive: bool | None
     show_body_text: bool | None
     video_send_mode: str | None
-    video_codecs: str | None
+    video_codec_list: list | None
     video_quality: str | None
+    nsfw: str | None
+    max_page: int | None
 
     @property
     def name(self) -> str:
@@ -179,6 +184,9 @@ class ParserConfig(ConfigNodeContainer):
     zhihu: ParserItem
     xhs: ParserItem
     youtube: ParserItem
+    iwara: ParserItem
+    shipinhao: ParserItem
+    pixiv: ParserItem
 
     def __init__(self, nodes: list[dict[str, Any]]):
         super().__init__(nodes, item_cls=ParserItem)
@@ -237,7 +245,7 @@ class PluginConfig(ConfigNode):
         )
 
         # ---------- 路径 ----------
-        self.data_dir = StarTools.get_data_dir(self._plugin_name)
+        self.data_dir = Path(get_astrbot_data_path()) / self._plugin_name
         self.plugin_dir = Path(get_astrbot_plugin_path()) / self._plugin_name
         self.cache_dir = self.data_dir / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)

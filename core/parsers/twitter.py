@@ -204,14 +204,24 @@ class TwitterParser(BaseParser):
 
     @handle(
         "x.com",
-        r"https?://(?:www\.)?x\.com/(?P<username>[0-9A-Za-z_]{1,20})/status/(?P<status_id>\d+)(?:\?.*)?",
+        (
+            r"(?<![A-Za-z0-9.-])(?:https?://)?(?:(?:www|mobile)\.)?x\.com/"
+            r"(?P<username>[0-9A-Za-z_]+)(?:/[0-9A-Za-z_]+)*/status/"
+            r"(?P<status_id>\d+)(?:\?[^\s]*)?"
+        ),
     )
     @handle(
         "twitter.com",
-        r"https?://(?:www\.)?twitter\.com/(?P<username>[0-9A-Za-z_]{1,20})/status/(?P<status_id>\d+)(?:\?.*)?",
+        (
+            r"(?<![A-Za-z0-9.-])(?:https?://)?(?:(?:www|mobile)\.)?twitter\.com/"
+            r"(?P<username>[0-9A-Za-z_]+)(?:/[0-9A-Za-z_]+)*/status/"
+            r"(?P<status_id>\d+)(?:\?[^\s]*)?"
+        ),
     )
     async def _parse(self, searched: re.Match[str]) -> ParseResult:
         url = searched.group(0)
+        if not url.lower().startswith(("http://", "https://")):
+            url = f"https://{url}"
         username = searched.groupdict().get("username")
         status_id = searched.groupdict().get("status_id")
 
