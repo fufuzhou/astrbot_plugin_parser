@@ -25,6 +25,7 @@ from .data import (
     FileContent,
     GraphicsContent,
     ImageContent,
+    MediaContent,
     ParseResult,
     SendGroup,
     TextContent,
@@ -76,6 +77,7 @@ class MessageSender:
         *,
         force_merge_override: bool | None = None,
         render_card_override: bool | None = None,
+        cancel_downloads: bool = True,
     ) -> dict:
         """
         根据解析结果生成发送计划（plan）
@@ -97,7 +99,8 @@ class MessageSender:
                     if self._has_ready_media_path(cont):
                         heavy.append(cont)
                     else:
-                        self._cancel_pending_media_download(cont)
+                        if cancel_downloads:
+                            self._cancel_pending_media_download(cont)
                         links.append(cont)
                 case FileContent():
                     heavy.append(cont)
@@ -219,31 +222,15 @@ class MessageSender:
 
         seen_links: set[str] = set()
         for cont in plan["links"]:
-            match cont:
-                case VideoContent():
-                    try:
-                        cover_path = await cont.get_cover_path()
-                        if cover_path:
-                            segs.append(self._image_from_path(cover_path))
-                    except (DownloadException, DownloadLimitException, ZeroSizeException):
-                        pass
-
-                    url = self._extract_media_url(cont.path_task)
-                    if url and url not in seen_links:
-                        segs.append(Plain(f"视频链接: {url}"))
-                        seen_links.add(url)
-
-                case AudioContent():
-                    url = self._extract_media_url(cont.path_task)
-                    if url and url not in seen_links:
-                        segs.append(Plain(f"音频链接: {url}"))
-                        seen_links.add(url)
-
-                case DynamicContent():
-                    url = self._extract_media_url(cont.path_task)
-                    if url and url not in seen_links:
-                        segs.append(Plain(f"动图链接: {url}"))
-                        seen_links.add(url)
+            if isinstance(cont, VideoContent):
+                try:
+                    cover_path = await cont.get_cover_path()
+                    if cover_path:
+                        segs.append(self._image_from_path(cover_path))
+                except (DownloadException, DownloadLimitException, ZeroSizeException):
+                    pass
+            if text := self._media_link_text(cont, seen_links):
+                segs.append(Plain(text))
 
         for cont in plan["light"]:
             if isinstance(cont, TextContent):
@@ -339,41 +326,67 @@ class MessageSender:
             return result.send_groups
         return [SendGroup(contents=list(MessageSender._iter_contents(result)))]
 
-    async def _is_exact_text_echo(
+    def _media_link_text(self, cont: MediaContent, seen: set[str]) -> str | None:
+        labels = {VideoContent: "视频链接", AudioContent: "音频链接", DynamicContent: "动图链接"}
+        label = next((value for cls, value in labels.items() if isinstance(cont, cls)), None)
+        url = self._extract_media_url(cont.path_task)
+        if not label or not url or url in seen:
+            return None
+        seen.add(url)
+        return f"{label}: {url}"
+
+    def _planned_text(self, plan: dict) -> str:
+        """Project the text we intend to send, without downloading or rendering."""
+        parts = []
+        if isinstance(plan.get("summary_text"), str) and plan["summary_text"].strip():
+            parts.append(plan["summary_text"])
+        seen: set[str] = set()
+        for cont in plan["links"]:
+            if text := self._media_link_text(cont, seen):
+                parts.append(text)
+        for cont in plan["light"]:
+            if isinstance(cont, TextContent) and cont.text:
+                parts.append(cont.text)
+            elif isinstance(cont, GraphicsContent):
+                parts.extend(text for text in (cont.text, cont.alt) if text)
+        return "".join(parts)
+
+    def _is_exact_text_echo(
         self,
         event: AstrMessageEvent,
         result: ParseResult,
         groups: list[SendGroup],
     ) -> bool:
-        """Only suppress a complete, single plain-text reply to plain-text input."""
+        """Matching full text suppresses all output, regardless of attached media."""
         incoming = event.get_messages()
-        if not incoming or not all(isinstance(seg, Plain) for seg in incoming):
-            return False
-        if len(groups) != 1:
-            return False
-        group = groups[0]
-        # Check before planning: media planning can cancel pending downloads.
-        if not all(isinstance(cont, TextContent) for cont in group.contents):
-            return False
-        plan = self._build_send_plan(
-            result,
-            group.contents,
-            force_merge_override=group.force_merge,
-            render_card_override=group.render_card,
-        )
-        if plan["render_card"] or plan["force_merge"]:
-            return False
-        # This guarded text-only path cannot download media or render a card.
-        segments = await self._build_segments(result, plan)
-        if not segments or not all(isinstance(seg, Plain) for seg in segments):
-            return False
+        original = "".join(seg.text for seg in incoming if isinstance(seg, Plain))
+        outputs = []
+        for group in groups:
+            plan = self._build_send_plan(
+                result,
+                group.contents,
+                force_merge_override=group.force_merge,
+                render_card_override=group.render_card,
+                cancel_downloads=False,
+            )
+            outputs.append(self._planned_text(plan))
 
         def normalize(text: str) -> str:
             return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
-        original = normalize("".join(seg.text for seg in incoming))
-        outgoing = normalize("".join(seg.text for seg in segments))
+        original = normalize(original)
+        outgoing = normalize("".join(outputs))
         return bool(original) and original == outgoing
+
+    @staticmethod
+    def _cancel_echo_downloads(result: ParseResult, groups: list[SendGroup]) -> None:
+        # Parsing may already have scheduled downloads; a skipped reply needs none.
+        contents = list(MessageSender._iter_contents(result))
+        contents.extend(cont for group in groups for cont in group.contents)
+        for cont in contents:
+            for task in (getattr(cont, "path_task", None), getattr(cont, "cover", None)):
+                if isinstance(task, Task) and not task.done():
+                    task.cancel()
 
     async def _send_group(
         self,
@@ -429,15 +442,16 @@ class MessageSender:
         发送解析结果的统一入口
 
         执行顺序固定：
-        1. 检查完整纯文本回声；未命中则构建发送计划
+        1. 检查完整文本回声；未命中则构建发送计划
         2. 发送预览卡片（如有）
         3. 构建消息段
         4. 必要时合并转发
         5. 最终发送
         """
         groups = self._resolve_groups(result)
-        if await self._is_exact_text_echo(event, result, groups):
-            logger.info("[解析回声] 输入与完整纯文本输出相同，跳过全部发送")
+        if self._is_exact_text_echo(event, result, groups):
+            self._cancel_echo_downloads(result, groups)
+            logger.info("[解析回声] 输入文本与完整解析文本相同，跳过全部发送（含媒体）")
             return
 
         sent = False

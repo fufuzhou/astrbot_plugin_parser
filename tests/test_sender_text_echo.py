@@ -107,7 +107,7 @@ async def test_different_text_is_sent(sender, result, kind):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('case', ['input_image', 'output_image', 'output_video',
                                   'force_merge', 'render_card', 'multiple_groups'])
-async def test_media_and_structured_output_bypass_text_guard(sender, result, case):
+async def test_equal_text_suppresses_media_and_structured_output(sender, result, case):
     chain = [Plain(sender._build_text_summary(result))]
     if case == 'input_image':
         chain.append(Image())
@@ -121,18 +121,20 @@ async def test_media_and_structured_output_bypass_text_guard(sender, result, cas
         result.send_groups = [data.SendGroup(render_card=True)]
     else:
         result.send_groups = [data.SendGroup(), data.SendGroup()]
-    # Verify normal dispatch remains reachable without requiring media IO here.
+        chain.append(Plain(sender._build_text_summary(result)))
+    # Equal full text suppresses all groups before any media IO.
     sender._send_group = AsyncMock(return_value=True)
     await sender.send_parse_result(Event(chain), result)
-    assert sender._send_group.await_count == (2 if case == 'multiple_groups' else 1)
+    sender._send_group.assert_not_awaited()
+    sender.renderer.render_card.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_forward_threshold_bypasses_plain_text_comparison(sender, result):
+async def test_forward_threshold_does_not_bypass_text_comparison(sender, result):
     sender.cfg.forward_threshold = 1
     sender._send_group = AsyncMock(return_value=True)
     await sender.send_parse_result(Event([Plain(sender._build_text_summary(result))]), result)
-    sender._send_group.assert_awaited_once()
+    sender._send_group.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -149,3 +151,91 @@ async def test_existing_fallback_still_runs_when_normal_send_fails(sender, resul
     await sender.send_parse_result(event, result)
     assert len(event.sent) == 1
     assert event.sent[0][0].text == result.header + '\n' + result.text
+
+
+@pytest.mark.asyncio
+async def test_bilibili_summary_and_cover_suppress_all_media(sender, result):
+    result.platform = data.Platform('bilibili', '哔哩哔哩')
+    result.author = data.Author('作者')
+    result.timestamp = 1700000000
+    result.extra['info'] = '时长: 03:21'
+    result.contents = [data.ImageContent(Path('cover.jpg')), data.VideoContent(Path('video.mp4'))]
+    sender._send_group = AsyncMock(return_value=True)
+    sender._build_text_fallback = lambda result: pytest.fail('must not fall back')
+    event = Event([Plain(sender._build_text_summary(result)), Image()])
+    await sender.send_parse_result(event, result)
+    sender._send_group.assert_not_awaited()
+    sender.renderer.render_card.assert_not_awaited()
+    assert event.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('difference', ['caption', 'missing_group', 'image_only', 'link_only'])
+async def test_media_with_different_full_text_still_dispatches(sender, result, difference):
+    full = sender._build_text_summary(result)
+    result.contents = [data.ImageContent(Path('cover.jpg'))]
+    event = Event([Plain(full), Image()])
+    if difference == 'caption':
+        result.contents.append(data.GraphicsContent(Path('extra.jpg'), text='新增说明', alt='注释'))
+    elif difference == 'missing_group':
+        result.send_groups = [data.SendGroup(), data.SendGroup(contents=[data.TextContent('新内容')])]
+    elif difference == 'image_only':
+        event = Event([Image()])
+    else:
+        event = Event([Plain(result.url), Image()])
+    sender._send_group = AsyncMock(return_value=True)
+    await sender.send_parse_result(event, result)
+    assert sender._send_group.await_count > 0
+
+
+@pytest.mark.asyncio
+async def test_graphics_caption_participates_in_comparison(sender, result):
+    result.contents = [data.GraphicsContent(Path('image.jpg'), text='说明', alt='注释')]
+    event = Event([Plain(sender._build_text_summary(result) + '说明注释'), Image()])
+    sender._send_group = AsyncMock(return_value=True)
+    await sender.send_parse_result(event, result)
+    sender._send_group.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('match', [True, False])
+async def test_pending_video_links_compare_without_download_and_cancel_on_echo(sender, result, match):
+    async def download():
+        await asyncio.Event().wait()
+    task = asyncio.create_task(download(), name='video|https://cdn.example/video.mp4')
+    cover = asyncio.create_task(download())
+    try:
+        result.contents = [data.VideoContent(task, cover=cover)]
+        text = sender._build_text_summary(result) + '视频链接: https://cdn.example/video.mp4'
+        event = Event([Plain(text if match else result.url), Image()])
+        sender._send_group = AsyncMock(return_value=True)
+        await sender.send_parse_result(event, result)
+        await asyncio.sleep(0)
+        assert task.cancelled() is match
+        assert cover.cancelled() is match
+        assert sender._send_group.await_count == (0 if match else 1)
+        sender.renderer.render_card.assert_not_awaited()
+    finally:
+        task.cancel()
+        cover.cancel()
+        await asyncio.gather(task, cover, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('content_type,label', [(data.AudioContent, '音频链接'),
+                                               (data.DynamicContent, '动图链接')])
+async def test_link_text_projection_matches_actual_segments(sender, result, content_type, label):
+    async def download():
+        await asyncio.Event().wait()
+    task = asyncio.create_task(download(), name='https://cdn.example/media')
+    try:
+        result.contents = [content_type(task), content_type(task)]
+        plan = sender._build_send_plan(result, cancel_downloads=False)
+        projection = sender._planned_text(plan)
+        segments = await sender._build_segments(result, plan)
+        assert projection == ''.join(seg.text for seg in segments)
+        assert projection.count(label) == 1
+        assert not task.cancelling()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
