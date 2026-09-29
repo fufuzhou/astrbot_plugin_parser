@@ -10,9 +10,8 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 from astrbot.api import logger
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.star.context import Context
-from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.astrbot_path import (
-    get_astrbot_data_path,
+    get_astrbot_plugin_data_path,
     get_astrbot_plugin_path,
 )
 
@@ -158,11 +157,25 @@ class ParserItem(ConfigNode):
     cookies: str | None
     block_sensitive: bool | None
     show_body_text: bool | None
+    use_original_image: bool | None
+    mixed_layout: bool | None
+    show_work_content: bool | None
+    text_max_length: int | None
     video_send_mode: str | None
     video_codec_list: list | None
     video_quality: str | None
+    video_codec: str | None
+    video_format: str | None
+    metube_url: str | None
+    wait_timeout: int | None
+    delete_after_fetch: bool | None
     nsfw: str | None
     max_page: int | None
+    send_blue_links: bool | None
+    qzone_credential_source: str | None
+    snowluma_http_url: str | None
+    snowluma_access_token: str | None
+    snowluma_credential_cache_seconds: int | None
 
     @property
     def name(self) -> str:
@@ -171,10 +184,12 @@ class ParserItem(ConfigNode):
 
 class ParserConfig(ConfigNodeContainer):
     acfun: ParserItem
+    allcpp: ParserItem
     bilibili: ParserItem
     douyin: ParserItem
     instagram: ParserItem
     kuaishou: ParserItem
+    metube: ParserItem
     ncm: ParserItem
     nga: ParserItem
     tiktok: ParserItem
@@ -187,6 +202,7 @@ class ParserConfig(ConfigNodeContainer):
     iwara: ParserItem
     shipinhao: ParserItem
     pixiv: ParserItem
+    qzone: ParserItem
 
     def __init__(self, nodes: list[dict[str, Any]]):
         super().__init__(nodes, item_cls=ParserItem)
@@ -203,6 +219,8 @@ class PluginConfig(ConfigNode):
     blacklist: list[str]
 
     arbiter: bool
+    require_at_in_group: bool
+    enable_reply_parse: bool
     debounce_interval: int
 
     source_max_size: int
@@ -245,7 +263,7 @@ class PluginConfig(ConfigNode):
         )
 
         # ---------- 路径 ----------
-        self.data_dir = Path(get_astrbot_data_path()) / self._plugin_name
+        self.data_dir = Path(get_astrbot_plugin_data_path()) / self._plugin_name
         self.plugin_dir = Path(get_astrbot_plugin_path()) / self._plugin_name
         self.cache_dir = self.data_dir / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)

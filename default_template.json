@@ -37,6 +37,8 @@
     "use_proxy": false,
     "cookies": "",
     "show_body_text": true,
+    "use_original_image": true,
+    "mixed_layout": true,
     "video_send_mode": "first"
   }
 ]

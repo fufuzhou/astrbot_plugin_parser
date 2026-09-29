@@ -175,20 +175,42 @@ class XiaoheiheParser(BaseParser):
         final_url = f"https://www.xiaoheihe.cn/app/bbs/link/{link_id}"
         author = self._build_author(link)
 
-        body_text, image_urls = self._parse_body_text_and_images(link)
+        segments = self._parse_body_segments(link)
+        body_text = "\n\n".join(
+            value for kind, value in segments if kind == "text"
+        ).strip()
+        image_urls = [value for kind, value in segments if kind == "image"]
         video_content = self._build_video_content(link)
         show_body_text = bool(getattr(self.mycfg, "show_body_text", False))
-        text_content = TextContent(body_text) if show_body_text and body_text else None
 
+        # 构建发送内容
+        mixed_layout = bool(getattr(self.mycfg, "mixed_layout", True))
         contents: list[MediaContent] = []
-        if image_urls:
-            contents.extend(
-                self.create_image_contents(image_urls, headers=self.headers)
-            )
-        if video_content is not None:
-            contents.append(video_content)
-        if text_content is not None:
-            contents.append(text_content)
+
+        if mixed_layout:
+            # 图文混排：文字块与图片块按原文顺序交错
+            for kind, value in segments:
+                if kind == "image":
+                    contents.extend(
+                        self.create_image_contents([value], headers=self.headers)
+                    )
+                elif kind == "text" and show_body_text:
+                    contents.append(TextContent(value))
+            if video_content is not None:
+                contents.append(video_content)
+        else:
+            # 旧排版：先发完全部图片（含视频），再统一发文字
+            for kind, value in segments:
+                if kind == "image":
+                    contents.extend(
+                        self.create_image_contents([value], headers=self.headers)
+                    )
+            if video_content is not None:
+                contents.append(video_content)
+            if show_body_text:
+                for kind, value in segments:
+                    if kind == "text":
+                        contents.append(TextContent(value))
 
         send_groups: list[SendGroup] = []
         primary_contents = [
@@ -853,23 +875,44 @@ class XiaoheiheParser(BaseParser):
             )
         return self.create_video_content(video_url, cover_url, headers=self.headers)
 
-    def _parse_body_text_and_images(
+    def _parse_body_segments(
         self, link: dict[str, Any]
-    ) -> tuple[str, list[str]]:
+    ) -> list[tuple[str, str]]:
+        """解析正文，返回保持原文顺序的图文段列表。
+
+        每项为 ("text", 文本) 或 ("image", 图片URL)；
+        相邻的文本块会合并为一段。
+        """
         raw_text = link.get("text")
         if not isinstance(raw_text, str) or not raw_text.strip():
-            return "", []
+            return []
         try:
             blocks = json.loads(raw_text)
         except json.JSONDecodeError:
-            return self._clean_text(raw_text), []
+            cleaned = self._clean_text(raw_text)
+            return [("text", cleaned)] if cleaned else []
 
         if not isinstance(blocks, list):
-            return self._clean_text(raw_text), []
+            cleaned = self._clean_text(raw_text)
+            return [("text", cleaned)] if cleaned else []
 
-        text_parts: list[str] = []
-        image_urls: list[str] = []
+        segments: list[tuple[str, str]] = []
         seen_images: set[str] = set()
+
+        def push_text(value: str) -> None:
+            value = value.strip()
+            if not value:
+                return
+            if segments and segments[-1][0] == "text":
+                segments[-1] = ("text", segments[-1][1] + "\n\n" + value)
+            else:
+                segments.append(("text", value))
+
+        def push_image(url: str) -> None:
+            dedup_key = self._image_dedup_key(url)
+            if url and dedup_key and dedup_key not in seen_images:
+                seen_images.add(dedup_key)
+                segments.append(("image", url))
 
         for block in blocks:
             if not isinstance(block, dict):
@@ -877,26 +920,18 @@ class XiaoheiheParser(BaseParser):
 
             block_type = str(block.get("type") or "")
             if block_type == "img":
-                url = self._normalize_image_url(str(block.get("url") or "").strip())
-                dedup_key = self._image_dedup_key(url)
-                if url and dedup_key and dedup_key not in seen_images:
-                    seen_images.add(dedup_key)
-                    image_urls.append(url)
+                push_image(
+                    self._normalize_image_url(str(block.get("url") or "").strip())
+                )
                 continue
 
             html_text = str(block.get("text") or "")
             if html_text:
-                cleaned = self._html_block_to_text(html_text)
-                if cleaned:
-                    text_parts.append(cleaned)
+                push_text(self._html_block_to_text(html_text))
                 for image_url in self._extract_images_from_html_block(html_text):
-                    dedup_key = self._image_dedup_key(image_url)
-                    if dedup_key and dedup_key not in seen_images:
-                        seen_images.add(dedup_key)
-                        image_urls.append(image_url)
+                    push_image(image_url)
 
-        text = "\n\n".join(part for part in text_parts if part).strip()
-        return text, image_urls
+        return segments
 
     def _extract_images_from_html_block(self, html_block: str) -> list[str]:
         urls: list[str] = []
@@ -920,6 +955,12 @@ class XiaoheiheParser(BaseParser):
             return ""
         if "/bbs/" not in url:
             return ""
+        # 接口给的 url 带七牛 imageMogr2 处理：重压缩并限制在 850x1450 内，大图会糊。
+        # 开启原图模式时去掉查询串，获取平台留存的原始文件。
+        if "imageMogr2" in url and getattr(
+            self.mycfg, "use_original_image", True
+        ):
+            url = url.split("?", 1)[0]
         return url
 
     def _image_dedup_key(self, url: str) -> str:
