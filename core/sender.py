@@ -339,6 +339,42 @@ class MessageSender:
             return result.send_groups
         return [SendGroup(contents=list(MessageSender._iter_contents(result)))]
 
+    async def _is_exact_text_echo(
+        self,
+        event: AstrMessageEvent,
+        result: ParseResult,
+        groups: list[SendGroup],
+    ) -> bool:
+        """Only suppress a complete, single plain-text reply to plain-text input."""
+        incoming = event.get_messages()
+        if not incoming or not all(isinstance(seg, Plain) for seg in incoming):
+            return False
+        if len(groups) != 1:
+            return False
+        group = groups[0]
+        # Check before planning: media planning can cancel pending downloads.
+        if not all(isinstance(cont, TextContent) for cont in group.contents):
+            return False
+        plan = self._build_send_plan(
+            result,
+            group.contents,
+            force_merge_override=group.force_merge,
+            render_card_override=group.render_card,
+        )
+        if plan["render_card"] or plan["force_merge"]:
+            return False
+        # This guarded text-only path cannot download media or render a card.
+        segments = await self._build_segments(result, plan)
+        if not segments or not all(isinstance(seg, Plain) for seg in segments):
+            return False
+
+        def normalize(text: str) -> str:
+            return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+        original = normalize("".join(seg.text for seg in incoming))
+        outgoing = normalize("".join(seg.text for seg in segments))
+        return bool(original) and original == outgoing
+
     async def _send_group(
         self,
         event: AstrMessageEvent,
@@ -393,13 +429,16 @@ class MessageSender:
         发送解析结果的统一入口
 
         执行顺序固定：
-        1. 构建发送计划
+        1. 检查完整纯文本回声；未命中则构建发送计划
         2. 发送预览卡片（如有）
         3. 构建消息段
         4. 必要时合并转发
         5. 最终发送
         """
         groups = self._resolve_groups(result)
+        if await self._is_exact_text_echo(event, result, groups):
+            logger.info("[解析回声] 输入与完整纯文本输出相同，跳过全部发送")
+            return
 
         sent = False
         for group in groups:
