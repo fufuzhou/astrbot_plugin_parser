@@ -625,7 +625,10 @@ class WeiboData(Struct):
             r"https?://[^\s<>\"]+\.(?:jpg|jpeg|png|webp|gif|bmp)(?:\?[^\s<>\"]*)?",
             self.text,
         ):
-            urls.append(self._normalize_image_url(link))
+            # 图片扩展名必须属于 URL 路径，不能只是跳转参数中的目标地址。
+            # sinaurl 等包装链接由短链展开流程处理，避免与展开后的直链重复。
+            if self._is_direct_image_url(link):
+                urls.append(self._normalize_image_url(link))
 
         # 去重，保序
         seen: set[str] = set()
