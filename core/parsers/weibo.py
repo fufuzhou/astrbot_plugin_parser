@@ -1,6 +1,8 @@
-from re import Match, sub
+from asyncio import gather
+from re import Match, findall, sub
 from time import time
 from typing import ClassVar
+from urllib.parse import urlparse
 from uuid import uuid4
 
 import msgspec
@@ -10,9 +12,22 @@ from msgspec import Struct
 
 from ..config import PluginConfig
 from ..cookie import CookieJar
-from ..data import MediaContent
+from ..data import MediaContent, ParseResult
 from ..download import Downloader
 from .base import BaseParser, ParseException, Platform, handle
+
+
+def _is_non_content_image_url(url: str) -> bool:
+    normalized = url.replace("&amp;", "&")
+    if normalized.startswith("//"):
+        normalized = f"https:{normalized}"
+
+    parsed = urlparse(normalized)
+    host = parsed.netloc.lower().split(":")[0]
+    path = parsed.path.lower()
+    if host == "face.t.sinajs.cn":
+        return True
+    return host == "h5.sinaimg.cn" and "timeline_card_" in path
 
 
 class WeiBoParser(BaseParser):
@@ -128,6 +143,8 @@ class WeiBoParser(BaseParser):
             elif element.name == "img":
                 src = element.get("src")
                 if isinstance(src, str):
+                    if _is_non_content_image_url(src):
+                        continue
                     text = "\n\n".join(text_buffer)
                     contents.append(self.create_graphics_content(src, text=text))
                     text_buffer.clear()
@@ -253,29 +270,57 @@ class WeiBoParser(BaseParser):
                 raise ParseException(
                     f"获取数据失败 content-type is not application/json (got: {ctype})"
                 )
+            # 必须在响应上下文内读取 body；退出 with 后连接可能已释放
+            payload = await resp.read()
 
         # 用 bytes 更稳，避免编码歧义
-        weibo_data = msgspec.json.decode(await resp.read(), type=WeiboResponse).data
+        weibo_data = msgspec.json.decode(payload, type=WeiboResponse).data
 
-        return self.build_weibo_data(weibo_data)
+        result = await self.build_weibo_data(weibo_data)
+        result.extra["weibo_thread_text"] = self.format_weibo_thread(result)
+        return result
 
-    def build_weibo_data(self, data: "WeiboData"):
+    async def build_weibo_data(self, data: "WeiboData"):
         contents = []
+        image_urls = list(data.image_urls)
+        expanded_links: list[str] = []
 
-        # 添加视频内容
+        # ??????
         if video_url := data.video_url:
             cover_url = data.cover_url
             contents.append(self.create_video_content(video_url, cover_url))
 
-        # 添加图片内容
-        if image_urls := data.image_urls:
+        # ????????????????????????????
+        short_links = self._collect_short_links(data)
+        if short_links:
+            resolved_links = await self._expand_short_links(short_links)
+            for resolved in resolved_links:
+                if self._is_direct_image_url(resolved):
+                    image_urls.append(resolved)
+                else:
+                    expanded_links.append(resolved)
+
+        image_urls = self._dedupe_image_urls(image_urls)
+        expanded_links = self._dedupe_urls(expanded_links)
+
+        # ??????
+        if image_urls:
             contents.extend(self.create_image_contents(image_urls))
 
-        # 构建作者
         author = self.create_author(data.display_name, data.user.profile_image_url)
         repost = None
         if data.retweeted_status:
-            repost = self.build_weibo_data(data.retweeted_status)
+            repost = await self.build_weibo_data(data.retweeted_status)
+
+        extra = {
+            "user_id": data.user.id,
+            "visibility": data.visibility_text,
+            "comments_count": data.comments_count or 0,
+            "reposts_count": data.reposts_count or 0,
+            "attitudes_count": data.attitudes_count or 0,
+            "iso_time": data.iso_time,
+            "expanded_links": expanded_links,
+        }
 
         return self.result(
             title=data.title,
@@ -284,8 +329,133 @@ class WeiBoParser(BaseParser):
             contents=contents,
             timestamp=data.timestamp,
             url=data.url,
+            extra=extra,
             repost=repost,
         )
+
+    @staticmethod
+    def _dedupe_urls(urls: list[str]) -> list[str]:
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for url in urls:
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            deduped.append(url)
+        return deduped
+
+    @classmethod
+    def _dedupe_image_urls(cls, urls: list[str]) -> list[str]:
+        seen_keys: set[str] = set()
+        deduped: list[str] = []
+        for url in urls:
+            if not url:
+                continue
+            if _is_non_content_image_url(url):
+                continue
+            key = cls._image_dedupe_key(url)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(url)
+        return deduped
+
+    @classmethod
+    def _image_dedupe_key(cls, url: str) -> str:
+        norm = cls._normalize_url(url)
+        parsed = urlparse(norm)
+        # 同一图片经常仅 query 不同（尺寸/质量参数），按路径去重
+        host = parsed.netloc.lower().split(":")[0]
+        path = parsed.path
+        return f"{host}{path}".lower()
+
+    def _collect_short_links(self, data: "WeiboData") -> list[str]:
+        candidates: list[str] = []
+        if data.url_struct:
+            for item in data.url_struct:
+                if item.short_url:
+                    candidates.append(self._normalize_url(item.short_url))
+                if item.long_url and self._is_short_link(item.long_url):
+                    candidates.append(self._normalize_url(item.long_url))
+
+        for link in findall(r"https?://[^\s<>\"]+", data.text):
+            if self._is_short_link(link):
+                candidates.append(self._normalize_url(link))
+
+        return self._dedupe_urls(candidates)
+
+    async def _expand_short_links(self, links: list[str]) -> list[str]:
+        async def expand_one(url: str) -> str:
+            try:
+                return self._normalize_url(await self.get_final_url(url, self.headers))
+            except Exception:
+                return self._normalize_url(url)
+
+        resolved = await gather(*(expand_one(link) for link in links))
+        return self._dedupe_urls(resolved)
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        url = url.replace("&amp;", "&")
+        if url.startswith("//"):
+            return "https:" + url
+        return url
+
+    @staticmethod
+    def _is_short_link(url: str) -> bool:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower().split(":")[0]
+        if host in {"t.cn", "s.weibo.com"}:
+            return True
+        if host == "weibo.cn" and parsed.path.startswith("/sinaurl"):
+            return True
+        return False
+
+    @staticmethod
+    def _is_direct_image_url(url: str) -> bool:
+        return bool(
+            sub(
+                r"\?.*$",
+                "",
+                url.lower(),
+            ).endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"))
+        )
+
+    def format_weibo_thread(self, result: "ParseResult") -> str:
+        blocks: list[str] = []
+        current: ParseResult | None = result
+        while current:
+            blocks.append(self._format_weibo_block(current))
+            current = current.repost
+        return "\n======================\n".join(blocks)
+
+    def _format_weibo_block(self, result: "ParseResult") -> str:
+        extra = result.extra or {}
+        visibility = str(extra.get("visibility") or "公开")
+        user_name = result.author.name if result.author else "未知用户"
+        user_id = extra.get("user_id")
+        user_tag = f"@{user_name}#{user_id}" if user_id else f"@{user_name}"
+        iso_time = extra.get("iso_time") or result.formatted_datetime()
+        url = result.url or ""
+        comments = int(extra.get("comments_count") or 0)
+        reposts = int(extra.get("reposts_count") or 0)
+        likes = int(extra.get("attitudes_count") or 0)
+        text = (result.text or "").strip()
+
+        lines = [
+            visibility,
+            user_tag,
+            f"时间: {iso_time}" if iso_time else "时间: 未知",
+            f"链接: {url}" if url else "链接: 未知",
+            f"💬: {comments} 🔁: {reposts} 👍🏻: {likes}",
+        ]
+        if text:
+            lines.append(text)
+        expanded_links = extra.get("expanded_links")
+        if isinstance(expanded_links, list):
+            for link in expanded_links:
+                lines.append(f"Expanded Link: {link}")
+        return "\n".join(lines)
 
     def _base62_encode(self, number: int) -> str:
         """将数字转换为 base62 编码"""
@@ -331,6 +501,13 @@ class Pic(Struct):
     large: LargeInPic
 
 
+class UrlStruct(Struct):
+    short_url: str | None = None
+    long_url: str | None = None
+    url_title: str | None = None
+    pic: str | None = None
+
+
 class Urls(Struct):
     mp4_720p_mp4: str | None = None
     mp4_hd_mp4: str | None = None
@@ -358,6 +535,10 @@ class User(Struct):
     """头像"""
 
 
+class Visible(Struct):
+    type: int | None = None
+
+
 class WeiboData(Struct):
     user: User
     text: str
@@ -370,7 +551,12 @@ class WeiboData(Struct):
 
     status_title: str | None = None
     pics: list[Pic] | None = None
+    url_struct: list[UrlStruct] | None = None
     page_info: PageInfo | None = None
+    attitudes_count: int | None = None
+    comments_count: int | None = None
+    reposts_count: int | None = None
+    visible: "Visible | None" = None
     retweeted_status: "WeiboData | None" = None  # 转发微博
 
     @property
@@ -390,6 +576,22 @@ class WeiboData(Struct):
         return text
 
     @property
+    def visibility_text(self) -> str:
+        if self.visible is None or self.visible.type in (None, 0):
+            return "公开"
+        return "可见范围受限"
+
+    @property
+    def iso_time(self) -> str | None:
+        from datetime import datetime
+
+        try:
+            dt = datetime.strptime(self.created_at, "%a %b %d %H:%M:%S %z %Y")
+            return dt.isoformat(timespec="seconds")
+        except ValueError:
+            return None
+
+    @property
     def cover_url(self) -> str | None:
         if self.page_info is None:
             return None
@@ -405,9 +607,54 @@ class WeiboData(Struct):
 
     @property
     def image_urls(self) -> list[str]:
+        urls: list[str] = []
         if self.pics:
-            return [x.large.url for x in self.pics]
-        return []
+            urls.extend(x.large.url for x in self.pics)
+
+        # 补充从微博链接卡片里提取到的图片
+        if self.url_struct:
+            for item in self.url_struct:
+                if item.pic:
+                    urls.append(self._normalize_image_url(item.pic))
+                for link in (item.long_url, item.short_url):
+                    if link and self._is_direct_image_url(link):
+                        urls.append(self._normalize_image_url(link))
+
+        # 兜底：正文里可能直接带了图片直链
+        for link in findall(
+            r"https?://[^\s<>\"]+\.(?:jpg|jpeg|png|webp|gif|bmp)(?:\?[^\s<>\"]*)?",
+            self.text,
+        ):
+            urls.append(self._normalize_image_url(link))
+
+        # 去重，保序
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for url in urls:
+            if not url or url in seen:
+                continue
+            if _is_non_content_image_url(url):
+                continue
+            seen.add(url)
+            deduped.append(url)
+        return deduped
+
+    @staticmethod
+    def _normalize_image_url(url: str) -> str:
+        url = url.replace("&amp;", "&")
+        if url.startswith("//"):
+            return "https:" + url
+        return url
+
+    @staticmethod
+    def _is_direct_image_url(url: str) -> bool:
+        return bool(
+            sub(
+                r"\?.*$",
+                "",
+                url.lower(),
+            ).endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"))
+        )
 
     @property
     def url(self) -> str:
@@ -415,10 +662,10 @@ class WeiboData(Struct):
 
     @property
     def timestamp(self) -> int:
-        from time import mktime, strptime
+        from datetime import datetime
 
-        create_at = strptime(self.created_at, "%a %b %d %H:%M:%S %z %Y")
-        return int(mktime(create_at))
+        create_at = datetime.strptime(self.created_at, "%a %b %d %H:%M:%S %z %Y")
+        return int(create_at.timestamp())
 
 
 class WeiboResponse(Struct):
