@@ -34,7 +34,7 @@ class ParserPlugin(Star):
         self.renderer = Renderer(self.cfg)
         self.downloader = Downloader(self.cfg)
         self.debouncer = Debouncer(self.cfg)
-        self.arbiter = EmojiLikeArbiter()
+        self.arbiter = EmojiLikeArbiter(logger=logger)
         self.sender = MessageSender(self.cfg, self.renderer)
         self.cleaner = CacheCleaner(self.cfg)
 

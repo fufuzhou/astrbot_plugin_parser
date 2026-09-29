@@ -1,200 +1,149 @@
+"""Conservative emoji arbitration; delayed/inconsistent views can still race.
+
+Keep upstream emoji IDs and ordering. Prefer silence over an uncertain winner;
+there is deliberately no timeout-based promotion of another candidate.
 """
-EmojiLikeArbiter 协议实现（生产级）
-
-本实现是 EmojiLikeArbiter 协议的参考实现：
-- 无状态
-- 弱一致
-- 确定性递补
-- CQHTTP（OneBot v11）语义级通用
-
-协议一致性仅依赖：
-- 同一条消息
-- 同一参与者集合
-- 同一 msg_time
-- 同一排序规则
-- 同一固定时间窗口
-
-⚠️ 本文件【不依赖任何机器人框架】
-⚠️ 仅假设 bot 对象支持 CQHTTP 标准 action
-"""
-
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from dataclasses import dataclass
 from typing import Any
-
-# ======================================================================
-# 仲裁最小不可变上下文
-# ======================================================================
 
 
 @dataclass(frozen=True)
 class ArbiterContext:
-    """
-    仲裁所需的最小不可变上下文。
-
-    任一字段缺失或非法，均视为不满足协议前提。
-    """
-
     message_id: int
     msg_time: int
     self_id: int
 
 
-# ======================================================================
-# EmojiLikeArbiter 协议核心实现
-# ======================================================================
-
-
 class EmojiLikeArbiter:
-    """
-    基于 CQHTTP 表情点赞状态的弱一致分布式仲裁器（支持确定性递补）。
-
-    协议特性：
-    - 仲裁顺序一次性确定
-    - 递补不重新仲裁，仅推进顺序指针
-    - 表情 124 作为“胜出权存在性证明”
-    """
-
-    # ================= 协议常量（严禁配置化） =================
-
     _EMOJI_ID = 289
-    _EMOJI_TYPE = "1"
-    _WAIT_SEC = 1.0
-
     _FEEDBACK_EMOJI_ID = 124
-    _FEEDBACK_EMOJI_TYPE = "1"
+    _WAIT_SEC = 1.0
     _FEEDBACK_WAIT_SEC = 0.7
-
+    _API_TIMEOUT_SEC = 3.0
     _TIME_SLICE = 60
+    _FETCH_LIMIT = 20
+    _SEEN_TTL_SEC = 120.0
+    _SEEN_LIMIT = 4096
 
-    # ================= 对外唯一入口 =================
+    def __init__(self, logger: Any = None):
+        self._logger = logger or logging.getLogger(__name__)
+        self._seen: dict[tuple[int, int], float] = {}
 
     async def compete(self, bot: Any, ctx: ArbiterContext) -> bool:
-        """
-        执行一次完整的 EmojiLikeArbiter 仲裁流程。
+        """Require stable membership and exclusive self feedback, even when alone."""
+        label = f"[arbiter] mid={ctx.message_id} self={ctx.self_id} time={ctx.msg_time}"
 
-        :param bot: 任意 CQHTTP Bot（支持 set_msg_emoji_like / fetch_emoji_like）
-        :param ctx: 仲裁上下文（由框架侧构造）
-        :return: 当前 Bot 是否为实际胜出者
-        """
+        def finish(reason: str, win: bool = False) -> bool:
+            self._logger.info(f"{label} win={win} reason={reason}")
+            return win
 
-        mid = ctx.message_id
+        if ctx.self_id <= 0 or ctx.msg_time <= 0:
+            return finish("invalid_context")
+        now = time.monotonic()
+        self._seen = {key: expiry for key, expiry in self._seen.items() if expiry > now}
+        key = (ctx.self_id, ctx.message_id)
+        if key in self._seen:
+            return finish("duplicate_event")
+        if len(self._seen) >= self._SEEN_LIMIT:
+            return finish("local_capacity_reached")
+        # Reserve before the first await to suppress concurrent duplicate events.
+        self._seen[key] = now + self._SEEN_TTL_SEC
 
-        # Phase 1：初始窗口检测
-        if await self._fetch_users(bot, mid, self._EMOJI_ID, self._EMOJI_TYPE):
-            return False
-
-        # Phase 2：占坑
-        try:
-            await bot.set_msg_emoji_like(
-                message_id=mid,
-                emoji_id=self._EMOJI_ID,
-                emoji_type=self._EMOJI_TYPE,
-                set=True,
+        async def read(emoji: int) -> set[int] | None:
+            users = await self._fetch_users(bot, ctx.message_id, emoji)
+            self._logger.debug(
+                f"{label} emoji={emoji} users={sorted(users) if users is not None else None}"
             )
-        except Exception:
-            return False
+            return users
 
-        # Phase 3：仲裁窗口等待
+        users = await read(self._EMOJI_ID)
+        if users is None or users:
+            return finish("registration_unavailable_or_already_started")
+        feedback = await read(self._FEEDBACK_EMOJI_ID)
+        if feedback is None or feedback:
+            return finish("existing_or_unknown_feedback")
+        if not await self._mark(bot, ctx.message_id, self._EMOJI_ID):
+            return finish("registration_failed")
+
         await asyncio.sleep(self._WAIT_SEC)
+        participants = await read(self._EMOJI_ID)
+        if not participants or ctx.self_id not in participants:
+            return finish("missing_registration")
+        await asyncio.sleep(self._FEEDBACK_WAIT_SEC)
+        if await read(self._EMOJI_ID) != participants:
+            return finish("membership_changed_before_election")
+        order = self._decide_order(list(participants), ctx.msg_time)
+        self._logger.debug(f"{label} order={order}")
+        if order[0] != ctx.self_id:
+            return finish("not_first_candidate")
 
-        # Phase 4：参与者收集
-        users = await self._fetch_users(bot, mid, self._EMOJI_ID, self._EMOJI_TYPE)
-        if not users:
-            # 极端 API 延迟兜底：视为成功
+        feedback = await read(self._FEEDBACK_EMOJI_ID)
+        if feedback is None or feedback:
+            return finish("feedback_present_before_claim")
+        if not await self._mark(bot, ctx.message_id, self._FEEDBACK_EMOJI_ID):
+            return finish("claim_failed")
+        for _ in range(2):
+            await asyncio.sleep(self._FEEDBACK_WAIT_SEC)
+            if await read(self._EMOJI_ID) != participants:
+                return finish("membership_changed_after_claim")
+            if await read(self._FEEDBACK_EMOJI_ID) != {ctx.self_id}:
+                return finish("feedback_not_exclusively_self")
+        return finish("confirmed", True)
+
+    @staticmethod
+    def _action_failed(resp: Any) -> bool:
+        return isinstance(resp, dict) and (
+            resp.get("status", "ok") != "ok" or resp.get("retcode", 0) != 0
+        )
+
+    async def _mark(self, bot: Any, mid: int, emoji: int) -> bool:
+        try:
+            resp = await asyncio.wait_for(
+                bot.set_msg_emoji_like(
+                    message_id=mid, emoji_id=emoji, emoji_type="1", set=True
+                ), timeout=self._API_TIMEOUT_SEC,
+            )
+            if self._action_failed(resp):
+                raise ValueError("unsuccessful action status")
             return True
-
-        # Phase 5：胜出顺序计算（仅一次）
-        order = self._decide_order(users, ctx.msg_time)
-        if not order:
+        except Exception as exc:
+            self._logger.warning(
+                f"[arbiter] mid={mid} emoji={emoji} mark_failed={type(exc).__name__}: {exc}"
+            )
             return False
 
-        # Fast-Path：单参与者
-        if len(order) == 1:
-            return order[0] == ctx.self_id
-
-        # Phase 6：确定性递补确认
-        for candidate in order:
-            if candidate == ctx.self_id:
-                try:
-                    await bot.set_msg_emoji_like(
-                        message_id=mid,
-                        emoji_id=self._FEEDBACK_EMOJI_ID,
-                        emoji_type=self._FEEDBACK_EMOJI_TYPE,
-                        set=True,
-                    )
-                except Exception:
-                    pass
-
-            await asyncio.sleep(self._FEEDBACK_WAIT_SEC)
-
-            if await self._has_feedback(bot, mid):
-                return candidate == ctx.self_id
-
-        return False
-
-    # ================= 内部方法 =================
-
-    async def _fetch_users(
-        self,
-        bot: Any,
-        message_id: int,
-        emoji_id: int,
-        emoji_type: str,
-    ) -> list[int]:
-        """
-        拉取指定表情的点赞用户列表。
-        """
+    async def _fetch_users(self, bot: Any, mid: int, emoji: int) -> set[int] | None:
+        """None means unknown; an empty set means a successful empty response."""
         try:
-            resp = await bot.fetch_emoji_like(
-                message_id=message_id,
-                emoji_id=str(emoji_id),
-                emojiId=str(emoji_id),
-                emojiType=emoji_type,
-                count=20,
+            resp = await asyncio.wait_for(
+                bot.fetch_emoji_like(
+                    message_id=mid, emoji_id=str(emoji), emojiId=str(emoji),
+                    emojiType="1", count=self._FETCH_LIMIT,
+                ), timeout=self._API_TIMEOUT_SEC,
             )
-        except Exception:
-            return []
-
-        likes = (resp or {}).get("emojiLikesList") or []
-        users: list[int] = []
-
-        for item in likes:
-            try:
-                users.append(int(item["tinyId"]))
-            except Exception:
-                continue
-
-        return users
-
-    async def _has_feedback(self, bot: Any, message_id: int) -> bool:
-        """
-        判断是否观测到胜出确认信号（表情 124）。
-        """
-        users = await self._fetch_users(
-            bot,
-            message_id,
-            self._FEEDBACK_EMOJI_ID,
-            self._FEEDBACK_EMOJI_TYPE,
-        )
-        return bool(users)
+            if not isinstance(resp, dict) or self._action_failed(resp):
+                raise ValueError("invalid action response")
+            likes = resp.get("emojiLikesList")
+            if not isinstance(likes, list) or len(likes) >= self._FETCH_LIMIT:
+                raise ValueError("missing or potentially truncated user list")
+            users = {int(item["tinyId"]) for item in likes}
+            if any(uid <= 0 for uid in users):
+                raise ValueError("invalid user ID")
+            return users
+        except Exception as exc:
+            self._logger.warning(
+                f"[arbiter] mid={mid} emoji={emoji} query_failed={type(exc).__name__}: {exc}"
+            )
+            return None
 
     def _decide_order(self, users: list[int], msg_time: int) -> list[int]:
-        """
-        基于确定性规则生成胜出递补顺序。
-
-        保证：
-        - 顺序在所有 Bot 上完全一致
-        - 不随时间推进而变化
-        """
         participants = sorted(set(users))
         if not participants:
             return []
-
         base = (msg_time // self._TIME_SLICE) % len(participants)
-        return [
-            participants[(base + i) % len(participants)]
-            for i in range(len(participants))
-        ]
+        return participants[base:] + participants[:base]
