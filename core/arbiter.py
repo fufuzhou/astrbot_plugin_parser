@@ -23,7 +23,8 @@ class EmojiLikeArbiter:
     _EMOJI_ID = 289
     _FEEDBACK_EMOJI_ID = 124
     _WAIT_SEC = 1.0
-    _FEEDBACK_WAIT_SEC = 0.7
+    _SAMPLE_SEC = 0.7
+    _FEEDBACK_WAIT_SEC = 0.2
     _API_TIMEOUT_SEC = 3.0
     _TIME_SLICE = 60
     _FETCH_LIMIT = 20
@@ -70,11 +71,13 @@ class EmojiLikeArbiter:
         if not await self._mark(bot, ctx.message_id, self._EMOJI_ID):
             return finish("registration_failed")
 
-        await asyncio.sleep(self._WAIT_SEC)
+        window_start = time.monotonic()
+        await asyncio.sleep(self._SAMPLE_SEC)
         participants = await read(self._EMOJI_ID)
         if not participants or ctx.self_id not in participants:
             return finish("missing_registration")
-        await asyncio.sleep(self._FEEDBACK_WAIT_SEC)
+        # Sample inside the original registration window rather than after it.
+        await asyncio.sleep(max(0.0, window_start + self._WAIT_SEC - time.monotonic()))
         if await read(self._EMOJI_ID) != participants:
             return finish("membership_changed_before_election")
         order = self._decide_order(list(participants), ctx.msg_time)
@@ -89,9 +92,12 @@ class EmojiLikeArbiter:
             return finish("claim_failed")
         for _ in range(2):
             await asyncio.sleep(self._FEEDBACK_WAIT_SEC)
-            if await read(self._EMOJI_ID) != participants:
+            current_users, current_feedback = await asyncio.gather(
+                read(self._EMOJI_ID), read(self._FEEDBACK_EMOJI_ID)
+            )
+            if current_users != participants:
                 return finish("membership_changed_after_claim")
-            if await read(self._FEEDBACK_EMOJI_ID) != {ctx.self_id}:
+            if current_feedback != {ctx.self_id}:
                 return finish("feedback_not_exclusively_self")
         return finish("confirmed", True)
 

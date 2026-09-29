@@ -220,6 +220,12 @@ class ParserPlugin(Star):
             return
         logger.debug(f"匹配结果: {keyword}, {searched}")
 
+        # Remember observed links even when another Bot wins arbitration.
+        link = searched.group(0)
+        if self.debouncer.hit_link(debounce_session, link):
+            logger.warning(f"[链接防抖] 链接 {link} 在防抖时间内，跳过解析")
+            return
+
         if isinstance(event, AiocqhttpMessageEvent) and not event.is_private_chat():
             raw = event.message_obj.raw_message
             if not isinstance(raw, dict):
@@ -238,11 +244,6 @@ class ParserPlugin(Star):
                 logger.debug("Bot 在仲裁中未获胜，跳过解析")
                 return
             logger.debug("Bot 在仲裁中获胜，开始解析")
-
-        link = searched.group(0)
-        if self.debouncer.hit_link(debounce_session, link):
-            logger.warning(f"[链接防抖] 链接 {link} 在防抖时间内，跳过解析")
-            return
 
         try:
             parse_res = await self.parser_map[keyword].parse(keyword, searched)

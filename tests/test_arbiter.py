@@ -131,3 +131,21 @@ async def test_existing_feedback_blocks_new_registration():
     bot = Bot([[]], [[2]])
     assert not await EmojiLikeArbiter().compete(bot, ctx())
     assert not bot.marks
+
+
+@pytest.mark.asyncio
+async def test_registration_samples_share_window_and_total_wait_is_1_4(monkeypatch):
+    from types import SimpleNamespace
+    now = [0.0]
+    waits = []
+
+    async def sleep(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr('core.arbiter.time', SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr('core.arbiter.asyncio.sleep', sleep)
+    bot = Bot([[], [1], [1], [1], [1]], [[], [], [1], [1]])
+    assert await EmojiLikeArbiter().compete(bot, ctx())
+    assert waits == pytest.approx([0.7, 0.3, 0.2, 0.2])
+    assert sum(waits) == pytest.approx(1.4)
