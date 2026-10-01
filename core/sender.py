@@ -351,6 +351,31 @@ class MessageSender:
                 parts.extend(text for text in (cont.text, cont.alt) if text)
         return "".join(parts)
 
+    @staticmethod
+    def _normalize_echo_text(text: str, result: ParseResult) -> str:
+        text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if result.platform.name != "weibo" or not result.extra.get("weibo_thread_text"):
+            return text
+        # Only remove the statistics slot of our recognizable Weibo header.
+        # Identical-looking lines in the body must remain significant.
+        blocks = text.split("\n======================\n")
+        for index, block in enumerate(blocks):
+            lines = block.split("\n")
+            if (
+                len(lines) >= 5
+                and lines[0] in {"公开", "可见范围受限"}
+                and re.fullmatch(r"@[^\n]+#\d+", lines[1])
+                and lines[2].startswith("时间: ")
+                and re.fullmatch(r"链接: https://weibo\.com/\d+/[A-Za-z0-9]+", lines[3])
+                and re.fullmatch(
+                    r"(?:💬)?\s*:\s*\d+\s+(?:🔁)?\s*:\s*\d+\s+(?:👍🏻?)?\s*:\s*\d+",
+                    lines[4],
+                )
+            ):
+                del lines[4]
+                blocks[index] = "\n".join(lines)
+        return "\n======================\n".join(blocks)
+
     def _is_exact_text_echo(
         self,
         event: AstrMessageEvent,
@@ -371,11 +396,8 @@ class MessageSender:
             )
             outputs.append(self._planned_text(plan))
 
-        def normalize(text: str) -> str:
-            return text.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-        original = normalize(original)
-        outgoing = normalize("".join(outputs))
+        original = self._normalize_echo_text(original, result)
+        outgoing = self._normalize_echo_text("".join(outputs), result)
         return bool(original) and original == outgoing
 
     @staticmethod
@@ -451,7 +473,7 @@ class MessageSender:
         groups = self._resolve_groups(result)
         if self._is_exact_text_echo(event, result, groups):
             self._cancel_echo_downloads(result, groups)
-            logger.info("[解析回声] 输入文本与完整解析文本相同，跳过全部发送（含媒体）")
+            logger.info("[解析回声] 输入与解析结果的稳定文本相同，跳过全部发送（含媒体）")
             return
 
         sent = False

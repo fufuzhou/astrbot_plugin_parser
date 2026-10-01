@@ -239,3 +239,83 @@ async def test_link_text_projection_matches_actual_segments(sender, result, cont
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+WEIBO_BODY = '问了一下店员，还是有激活任务，有需求可以联系附近门店问问。'
+
+
+def weibo_block(bid='RkF6U9Hx7', counters='💬: 56 🔁: 0 👍🏻: 100', body=WEIBO_BODY):
+    return ('公开\n@Kang#1694917363\n时间: 2026-10-01T16:24:34+08:00\n'
+            f'链接: https://weibo.com/1694917363/{bid}\n{counters}\n{body}')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('retweet', [False, True])
+async def test_weibo_counter_changes_do_not_repeat_reply(sender, result, retweet):
+    result.platform = data.Platform('weibo', '微博')
+    original = weibo_block()
+    new = weibo_block(counters='💬: 57 🔁: 2 👍🏻: 101')
+    if retweet:
+        original += '\n======================\n' + weibo_block('RkF1O2vGZ', body='转发正文')
+        new += '\n======================\n' + weibo_block('RkF1O2vGZ', counters='💬: 99 🔁: 3 👍🏻: 200', body='转发正文')
+    result.extra['weibo_thread_text'] = new
+    result.contents = [data.ImageContent(Path('repost.jpg'))]
+    sender._send_group = AsyncMock(return_value=True)
+    await sender.send_parse_result(Event([Plain(original), Image()]), result)
+    sender._send_group.assert_not_awaited()
+    sender.renderer.render_card.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('change', ['body', 'author', 'time', 'link', 'body_counter'])
+async def test_weibo_stable_field_differences_still_send(sender, result, change):
+    result.platform = data.Platform('weibo', '微博')
+    original = weibo_block(body=WEIBO_BODY + '\n💬: 1 🔁: 2 👍🏻: 3')
+    replacements = {'body': (WEIBO_BODY, '新的正文'),
+                    'author': ('@Kang#1694917363', '@Other#123'),
+                    'time': ('16:24:34', '17:24:34'),
+                    'link': ('RkF6U9Hx7', 'RkF1O2vGZ'),
+                    'body_counter': ('💬: 1 🔁: 2 👍🏻: 3', '💬: 5 🔁: 6 👍🏻: 7')}
+    old, new = replacements[change]
+    result.extra['weibo_thread_text'] = original.replace(old, new)
+    sender._send_group = AsyncMock(return_value=True)
+    await sender.send_parse_result(Event([Plain(original)]), result)
+    sender._send_group.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_counter_normalization_does_not_apply_to_other_platforms(sender, result):
+    result.extra['weibo_thread_text'] = weibo_block(counters='💬: 57 🔁: 0 👍🏻: 100')
+    sender._send_group = AsyncMock(return_value=True)
+    await sender.send_parse_result(Event([Plain(weibo_block())]), result)
+    sender._send_group.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unstructured_weibo_text_keeps_counter_lines(sender, result):
+    result.platform = data.Platform('weibo', '微博')
+    original = '用户随手写的文字\n💬: 56 🔁: 0 👍🏻: 100'
+    result.extra['weibo_thread_text'] = original.replace('56', '57')
+    sender._send_group = AsyncMock(return_value=True)
+    await sender.send_parse_result(Event([Plain(original)]), result)
+    sender._send_group.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('count_line', [': 29 : 0 : 33', '💬: 29 🔁: 0 👍: 33'])
+async def test_weibo_copied_statistics_without_emoji_still_match(sender, result, count_line):
+    result.platform = data.Platform('weibo', '微博')
+    result.extra['weibo_thread_text'] = weibo_block(counters='💬: 56 🔁: 0 👍🏻: 100')
+    sender._send_group = AsyncMock(return_value=True)
+    await sender.send_parse_result(Event([Plain(weibo_block(counters=count_line)), Image()]), result)
+    sender._send_group.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_weibo_missing_header_is_not_normalized(sender, result):
+    result.platform = data.Platform('weibo', '微博')
+    original = weibo_block().removeprefix('公开\n')
+    result.extra['weibo_thread_text'] = original.replace('56', '57')
+    sender._send_group = AsyncMock(return_value=True)
+    await sender.send_parse_result(Event([Plain(original)]), result)
+    sender._send_group.assert_awaited_once()
